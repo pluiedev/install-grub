@@ -7,7 +7,7 @@ use std::{
 	sync::atomic::{AtomicUsize, Ordering::SeqCst},
 };
 
-use anyhow::{bail, Context as _, Result};
+use eyre::{bail, Result, WrapErr};
 
 use crate::config::Config;
 

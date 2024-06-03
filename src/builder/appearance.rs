@@ -1,6 +1,6 @@
 use std::{collections::HashSet, fmt::Write as _, fs, path::PathBuf};
 
-use anyhow::{bail, Context as _, Result};
+use eyre::{bail, Result, WrapErr};
 use walkdir::WalkDir;
 
 use super::Builder;

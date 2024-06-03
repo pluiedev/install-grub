@@ -1,5 +1,6 @@
 use std::{borrow::Cow, collections::HashMap, iter::Iterator, path::Path};
 
+use eyre::{bail, eyre, Context, Result};
 use roxmltree::{Document, Node};
 
 use crate::grub::FsIdentifier;
@@ -70,10 +71,10 @@ impl Config<'_> {
 }
 
 pub trait NodeExt<'a, 'input: 'a> {
-	fn to<T: FromNode<'a, 'input>>(self) -> Result<T, Error<'a>>;
+	fn to<T: FromNode<'a, 'input>>(self) -> Result<T>;
 }
 pub trait FromNode<'a, 'input: 'a>: Sized {
-	fn from_node(node: Node<'a, 'input>) -> Result<Self, Error<'a>>;
+	fn from_node(node: Node<'a, 'input>) -> Result<Self>;
 }
 
 #[derive(Clone, Debug)]
@@ -85,24 +86,11 @@ pub enum Password<'a> {
 	Hashed(Cow<'a, str>),
 }
 
-#[derive(Debug)]
-pub enum Error<'a> {
-	UnexpectedTag { expected: &'a str, found: &'a str },
-	ValueAttrNotFound,
-	InvalidInt(std::num::ParseIntError),
-	KeyNotFound { key: &'a str },
-	InvalidHashedPassword { hash: Cow<'a, str>, user: &'a str },
-	PasswordNotFound { user: &'a str },
-	InvalidFsIdentifier(&'a str),
-	RootIsNotExpr,
-	RootExprIsEmpty,
-	Io(std::io::Error),
-}
-
 //= Implementation =//
 
 macro_rules! config {
   ($lifetime:lifetime; $($field:ident : $ty:ty => $key:ident),*$(,)?) => {
+    #[derive(Debug, Clone)]
     pub struct Config<$lifetime> {
       $(
         pub $field: $ty
@@ -110,14 +98,14 @@ macro_rules! config {
     }
 
     impl<'a> Config<'a> {
-	    pub fn new<'input: 'a>(doc: &'a Document<'input>) -> Result<Self, Error<'a>> {
+	    pub fn new<'input: 'a>(doc: &'a Document<'input>) -> Result<Self> {
 	    	let root_elem = doc.root_element();
 	    	if root_elem.tag_name().name() != "expr" {
-          return Err(Error::RootIsNotExpr);
+		        bail!("Root node of config is not <expr>");
 	    	}
 
 	    	let Some(root_attrs) = root_elem.first_element_child() else {
-          return Err(Error::RootExprIsEmpty);
+                bail!("Root <expr> is empty");
 	    	};
 
 	    	let root_attrs = root_attrs.to::<AttrsNode>()?;
@@ -132,7 +120,7 @@ macro_rules! config {
 use config;
 
 impl<'a, 'input: 'a> NodeExt<'a, 'input> for Node<'a, 'input> {
-	fn to<T: FromNode<'a, 'input>>(self) -> Result<T, Error<'a>> {
+	fn to<T: FromNode<'a, 'input>>(self) -> Result<T> {
 		T::from_node(self)
 	}
 }
@@ -141,16 +129,19 @@ struct AttrsNode<'a, 'input> {
 	node: Node<'a, 'input>,
 }
 impl<'a, 'input> AttrsNode<'a, 'input> {
-	fn attr(&self, key: &'input str) -> Result<Node<'a, 'input>, Error<'a>> {
+	fn attr(&self, key: &'input str) -> Result<Node<'a, 'input>> {
 		self.node
 			.children()
 			.find(|c| c.tag_name().name() == "attr" && c.attribute("name") == Some(key))
 			.and_then(|c| c.first_element_child())
-			.ok_or(Error::KeyNotFound { key })
+			.ok_or_else(|| eyre!("Key `{key}` not found in attrs"))
 	}
 
-	fn attr_to<T: FromNode<'a, 'input>>(&self, key: &'input str) -> Result<T, Error<'a>> {
-		self.attr(key).and_then(T::from_node)
+	fn attr_to<T: FromNode<'a, 'input>>(&self, key: &'input str) -> Result<T> {
+		let attr = self.attr(key)?;
+		let attr =
+			T::from_node(attr).with_context(|| format!("While trying to read attr `{key}`"))?;
+		Ok(attr)
 	}
 
 	fn attrs(&self) -> impl Iterator<Item = (&'a str, Node<'a, 'input>)> {
@@ -162,7 +153,7 @@ impl<'a, 'input> AttrsNode<'a, 'input> {
 }
 
 impl<'a, 'input: 'a> FromNode<'a, 'input> for Users<'a> {
-	fn from_node(node: Node<'a, 'input>) -> Result<Self, Error<'a>> {
+	fn from_node(node: Node<'a, 'input>) -> Result<Self> {
 		node.to::<AttrsNode>()?
 			.attrs()
 			.map(|(user, node)| {
@@ -174,26 +165,28 @@ impl<'a, 'input: 'a> FromNode<'a, 'input> for Users<'a> {
 				let password = fields.attr_to::<&str>("password");
 
 				let password = if let Ok(f) = hashed_password_file {
-					let f = std::fs::read_to_string(f).map_err(Error::Io)?;
+					let f = std::fs::read_to_string(f).with_context(|| {
+						format!("While trying to read hashed password file for user {user}")
+					})?;
 					Password::Hashed(f.into())
 				} else if let Ok(f) = hashed_password {
 					Password::Hashed(f.into())
 				} else if let Ok(f) = password_file {
-					let f = std::fs::read_to_string(f).map_err(Error::Io)?;
+					let f = std::fs::read_to_string(f).with_context(|| {
+						format!("While trying to read plain password file for user {user}")
+					})?;
 					Password::Plain(f.into())
 				} else if let Ok(f) = password {
 					Password::Plain(f.into())
 				} else {
-					return Err(Error::PasswordNotFound { user });
+					bail!("Password not found for user {user}!")
 				};
 
 				match password {
-					Password::Hashed(hash) if !hash.starts_with("grub.pdkdf2") => {
-						Err(Error::InvalidHashedPassword {
-							hash: hash.clone(),
-							user,
-						})
-					}
+					Password::Hashed(hash) if !hash.starts_with("grub.pbkdf2") => Err(eyre!(
+						"Invalid hashed password for user {user}: {hash} - hashes should always \
+						 start with `grub.pbkdf2!`"
+					)),
 
 					p => Ok((user, p)),
 				}
@@ -204,34 +197,34 @@ impl<'a, 'input: 'a> FromNode<'a, 'input> for Users<'a> {
 }
 
 impl<'a, 'input: 'a> FromNode<'a, 'input> for FsIdentifier {
-	fn from_node(node: Node<'a, 'input>) -> Result<Self, Error<'a>> {
+	fn from_node(node: Node<'a, 'input>) -> Result<Self> {
 		match node.to::<&str>()? {
 			"uuid" => Ok(Self::Uuid),
 			"label" => Ok(Self::Label),
 			"provided" => Ok(Self::Provided),
-			s => Err(Error::InvalidFsIdentifier(s)),
+			s => Err(eyre!("Invalid file system identifier: {s}")),
 		}
 	}
 }
 
 impl<'a, 'input: 'a> FromNode<'a, 'input> for &'a str {
-	fn from_node(node: Node<'a, 'input>) -> Result<Self, Error<'a>> {
+	fn from_node(node: Node<'a, 'input>) -> Result<Self> {
 		check_tag_name(node, "string", value)
 	}
 }
 impl<'a, 'input: 'a> FromNode<'a, 'input> for Option<&'a str> {
-	fn from_node(node: Node<'a, 'input>) -> Result<Self, Error<'a>> {
+	fn from_node(node: Node<'a, 'input>) -> Result<Self> {
 		let s = node.to::<&str>()?;
 		Ok(if s.is_empty() { None } else { Some(s) })
 	}
 }
 impl<'a, 'input: 'a> FromNode<'a, 'input> for &'a Path {
-	fn from_node(node: Node<'a, 'input>) -> Result<Self, Error<'a>> {
+	fn from_node(node: Node<'a, 'input>) -> Result<Self> {
 		node.to::<&str>().map(Path::new)
 	}
 }
 impl<'a, 'input: 'a> FromNode<'a, 'input> for Option<&'a Path> {
-	fn from_node(node: Node<'a, 'input>) -> Result<Self, Error<'a>> {
+	fn from_node(node: Node<'a, 'input>) -> Result<Self> {
 		let s = node.to::<&str>()?;
 		Ok(if s.is_empty() {
 			None
@@ -241,19 +234,22 @@ impl<'a, 'input: 'a> FromNode<'a, 'input> for Option<&'a Path> {
 	}
 }
 impl<'a, 'input: 'a> FromNode<'a, 'input> for bool {
-	fn from_node(node: Node<'a, 'input>) -> Result<Self, Error<'a>> {
+	fn from_node(node: Node<'a, 'input>) -> Result<Self> {
 		check_tag_name(node, "bool", |node| Ok(value(node)? == "true"))
 	}
 }
 impl<'a, 'input: 'a, T: FromNode<'a, 'input>> FromNode<'a, 'input> for Vec<T> {
-	fn from_node(node: Node<'a, 'input>) -> Result<Self, Error<'a>> {
+	fn from_node(node: Node<'a, 'input>) -> Result<Self> {
 		check_tag_name(node, "list", |node| {
-			node.children().map(T::from_node).collect()
+			node.children()
+				.filter(|n| n.is_element())
+				.map(T::from_node)
+				.collect()
 		})
 	}
 }
 impl<'a, 'input: 'a> FromNode<'a, 'input> for AttrsNode<'a, 'input> {
-	fn from_node(node: Node<'a, 'input>) -> Result<Self, Error<'a>> {
+	fn from_node(node: Node<'a, 'input>) -> Result<Self> {
 		check_tag_name(node, "attrs", |node| Ok(AttrsNode { node }))
 	}
 }
@@ -262,9 +258,9 @@ macro_rules! int_impl {
   ($($ty:ty)*) => {
     $(
       impl<'a, 'input: 'a> FromNode<'a, 'input> for $ty {
-      	fn from_node(node: Node<'a, 'input>) -> Result<Self, Error<'a>> {
+      	fn from_node(node: Node<'a, 'input>) -> Result<Self> {
 		      check_tag_name(node, "int", |node| {
-		      	value(node)?.parse::<$ty>().map_err(Error::InvalidInt)
+		      	value(node)?.parse::<$ty>().map_err(|e| eyre!("Invalid int: {e}"))
 		      })
       	}
       }
@@ -277,46 +273,20 @@ fn check_tag_name<'a, 'input, F, R>(
 	node: Node<'a, 'input>,
 	expected: &'static str,
 	f: F,
-) -> Result<R, Error<'a>>
+) -> Result<R>
 where
 	'input: 'a,
-	F: FnOnce(Node<'a, 'input>) -> Result<R, Error<'a>>,
+	F: FnOnce(Node<'a, 'input>) -> Result<R>,
 {
 	let found = node.tag_name().name();
 	if found == expected {
 		f(node)
 	} else {
-		Err(Error::UnexpectedTag { expected, found })
+		bail!("Found unexpected tag {found}, expecting {expected}");
 	}
 }
 
-fn value<'a, 'input: 'a>(node: Node<'a, 'input>) -> Result<&'a str, Error<'a>> {
-	node.attribute("value").ok_or(Error::ValueAttrNotFound)
+fn value<'a, 'input: 'a>(node: Node<'a, 'input>) -> Result<&'a str> {
+	node.attribute("value")
+		.ok_or(eyre!("`value` attribute not found"))
 }
-
-impl std::fmt::Display for Error<'_> {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		match self {
-			Self::UnexpectedTag { expected, found } => {
-				write!(f, "Found unexpected tag {found}, expecting {expected}")
-			}
-			Self::ValueAttrNotFound => write!(f, "`value` attribute not found"),
-			Self::InvalidInt(e) => write!(f, "Invalid integer: {e}"),
-			Self::KeyNotFound { key } => write!(f, "Key {key} not found in attrs"),
-			Self::InvalidHashedPassword { hash, user } => {
-				write!(
-					f,
-					"Invalid hashed password for user {user}: {hash} - hashes should always start \
-					 with `grub.pbkdf2!`"
-				)
-			}
-			Self::PasswordNotFound { user } => write!(f, "Password not found for user {user}!"),
-			Self::InvalidFsIdentifier(id) => write!(f, "Invalid file system identifier: {id}"),
-			Self::RootIsNotExpr => write!(f, "Root node of config is not <expr>"),
-			Self::RootExprIsEmpty => write!(f, "Root <expr> is empty"),
-			Self::Io(e) => write!(f, "IO Error: {e}"),
-		}
-	}
-}
-
-impl std::error::Error for Error<'_> {}

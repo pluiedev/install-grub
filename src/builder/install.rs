@@ -7,7 +7,7 @@ use std::{
 	process::Command,
 };
 
-use anyhow::{bail, Context, Result};
+use eyre::{bail, Context, Result};
 
 use super::Builder;
 use crate::config::Config;

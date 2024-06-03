@@ -7,7 +7,7 @@ use std::{
 	process::Command,
 };
 
-use anyhow::{anyhow, bail, Context, Result};
+use eyre::{bail, eyre, Context, Result};
 use indoc::eprintdoc;
 use nix::sys::stat::{umask, Mode};
 use tempfile::TempDir;
@@ -164,7 +164,7 @@ impl Builder<'_> {
 					.join("kernel")
 					.canonicalize()?
 					.parent()
-					.ok_or_else(|| anyhow!("Somehow $link/kernel doesn't have a parent"))?
+					.ok_or_else(|| eyre!("Somehow $link/kernel doesn't have a parent"))?
 					.join("lib/modules");
 
 				let Some(version) = fs::read_dir(&modules)?.find_map(|m| {
