@@ -75,7 +75,7 @@ impl Builder<'_> {
 		let target_package = match efi_target {
 			EfiTarget::Both { efi, .. } | EfiTarget::EfiOnly { efi, .. } => efi,
 			EfiTarget::BiosOnly { bios } => bios,
-			_ => todo!("This is unhandled in the Perl version!!"),
+			EfiTarget::Neither => todo!("This is unhandled in the Perl version!!"),
 		};
 
 		let mut cmd = Command::new(self.config.shell);

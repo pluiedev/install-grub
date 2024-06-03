@@ -310,7 +310,7 @@ impl Builder<'_> {
 		let secrets_name = format!("{system_name}-secrets");
 		let initrd_secrets_path = kernels.join(&secrets_name);
 
-		let secrets_added = if !self.dry_run {
+		let secrets_added = self.dry_run || {
 			fs::create_dir_all(&kernels)?;
 			fs::set_permissions(&kernels, PermissionsExt::from_mode(0o755))?;
 
@@ -353,8 +353,6 @@ impl Builder<'_> {
 			} else {
 				false
 			}
-		} else {
-			true
 		};
 
 		Ok(if secrets_added {

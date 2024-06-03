@@ -75,7 +75,7 @@ impl Grub {
 				status,
 				stdout: id_info,
 				..
-			} = Command::new(&btrfs)
+			} = Command::new(btrfs)
 				.arg("subvol")
 				.arg("show")
 				.arg(&fs.mount)
@@ -118,7 +118,7 @@ impl Grub {
 				status,
 				stdout: path_info,
 				..
-			} = Command::new(&btrfs)
+			} = Command::new(btrfs)
 				.arg("subvol")
 				.arg("list")
 				.arg(&fs.mount)
