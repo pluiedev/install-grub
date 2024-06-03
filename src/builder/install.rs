@@ -9,64 +9,114 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 
+use super::Builder;
 use crate::config::Config;
 
-/// Install GRUB if the parameters from the last time we installed it.
-pub fn install(conf: &Path, temp: &Path, copied: &HashSet<PathBuf>, config: &Config) -> Result<()> {
-	let efi_target = EfiTarget::deduce(config)?;
+impl Builder<'_> {
+	pub fn install(&mut self) -> Result<&mut Self> {
+		let efi_target = EfiTarget::deduce(&self.config)?;
+		let conf = self.config.boot_path.join("grub/grub.cfg");
+		let temp = self.config.boot_path.join("grub/grub.cfg.tmp");
+		let mut grub_state = GrubState::load(&self.config);
 
-	if config.use_os_prober {
-		let target_package = match &efi_target {
+		fs::write(&temp, &self.inner)?;
+
+		self.append_prepare_config()?;
+		self.run_os_prober(&efi_target, &temp)?;
+
+		// Atomically switch to the new config
+		fs::rename(&temp, &conf)
+			.with_context(|| format!("Cannot rename {} to {}", temp.display(), conf.display()))?;
+
+		self.remove_old_kernels()?;
+
+		if grub_state.update(&self.config, &efi_target) {
+			if std::env::var("NIXOS_INSTALL_GRUB").as_deref() == Ok("1") {
+				eprintln!("NIXOS_INSTALL_GRUB env var deprecated, use NIXOS_INSTALL_BOOTLOADER");
+				std::env::set_var("NIXOS_INSTALL_BOOTLOADER", "1");
+			}
+
+			self.install_bios(&efi_target)?;
+			self.install_efi(&efi_target)?;
+
+			grub_state.save()?;
+		};
+
+		Ok(self)
+	}
+
+	fn append_prepare_config(&self) -> Result<()> {
+		let extra_prepare_config = self
+			.config
+			.extra_prepare_config
+			.replace("@bootPath@", &self.config.boot_path.to_string_lossy());
+
+		if !extra_prepare_config.is_empty() {
+			Command::new(self.config.shell)
+				.arg("-c")
+				.arg(extra_prepare_config)
+				.status()?;
+		}
+
+		Ok(())
+	}
+
+	fn run_os_prober(&self, efi_target: &EfiTarget, temp: &Path) -> Result<()> {
+		if self.config.use_os_prober {
+			return Ok(());
+		}
+
+		let target_package = match efi_target {
 			EfiTarget::Both { efi, .. } | EfiTarget::EfiOnly { efi, .. } => efi,
 			EfiTarget::BiosOnly { bios } => bios,
 			_ => todo!("This is unhandled in the Perl version!!"),
 		};
 
-		Command::new(&config.shell)
-			.arg("-c")
-			.arg(format!(
-				"pkgdatadir={}/share/grub {0}/etc/grub.d/30_os-prober >> {}",
-				target_package.display(),
-				temp.display()
-			))
-			.status()?;
-	}
+		let mut cmd = Command::new(self.config.shell);
+		cmd.arg("-c").arg(format!(
+			"pkgdatadir={}/share/grub {0}/etc/grub.d/30_os-prober >> {}",
+			target_package.display(),
+			temp.display()
+		));
 
-	// Atomically switch to the new config
-	fs::rename(temp, conf)
-		.with_context(|| format!("Cannot rename {} to {}", temp.display(), conf.display()))?;
-
-	// Remove obsolete files from $bootPath/kernels
-	for file in fs::read_dir(config.boot_path.join("kernels"))? {
-		let file = file?;
-		let path = file.path();
-		if copied.contains(&path) {
-			continue;
+		if self.config.save_default() {
+			cmd.env("GRUB_SAVEDEFAULT", "true");
 		}
-		eprintln!("removing obsolete file {}", path.display());
-		fs::remove_file(path)?;
+
+		cmd.status()?;
+
+		Ok(())
 	}
 
-	if std::env::var("NIXOS_INSTALL_GRUB").as_deref() == Ok("1") {
-		eprintln!("NIXOS_INSTALL_GRUB env var deprecated, use NIXOS_INSTALL_BOOTLOADER");
-		std::env::set_var("NIXOS_INSTALL_BOOTLOADER", "1");
+	fn remove_old_kernels(&self) -> Result<()> {
+		// Remove obsolete files from $bootPath/kernels
+		for file in fs::read_dir(self.config.boot_path.join("kernels"))? {
+			let file = file?;
+			let path = file.path();
+
+			// Ignore files we have copied over ourselves
+			if self.copied.contains(&path) {
+				continue;
+			}
+			eprintln!("removing obsolete file {}", path.display());
+			fs::remove_file(path)?;
+		}
+
+		Ok(())
 	}
 
-	// install a symlink so that grub can detect the boot drive
-	let tmp_dir = tempfile::tempdir().context("Failed to create temporary space")?;
-	symlink(&config.boot_path, tmp_dir.path().join("boot"))
-		.with_context(|| format!("Failed to symlink {}/boot", tmp_dir.path().display()))?;
+	fn install_bios(&self, efi_target: &EfiTarget) -> Result<()> {
+		let Some((bios, bios_target)) = efi_target.bios() else {
+			return Ok(());
+		};
 
-	let mut grub_state = GrubState::load(config);
+		// install a symlink so that grub can detect the boot drive
+		let tmp_dir = tempfile::tempdir().context("Failed to create temporary space")?;
+		symlink(self.config.boot_path, tmp_dir.path().join("boot"))
+			.with_context(|| format!("Failed to symlink {}/boot", tmp_dir.path().display()))?;
 
-	if !grub_state.update(config, &efi_target) {
-		return Ok(());
-	}
-
-	// install non-EFI GRUB
-	if let Some((bios, bios_target)) = efi_target.bios() {
-		for dev in &config.devices {
-			if dev == Path::new("nodev") {
+		for dev in &self.config.devices {
+			if *dev == Path::new("nodev") {
 				continue;
 			}
 
@@ -77,9 +127,9 @@ pub fn install(conf: &Path, temp: &Path, copied: &HashSet<PathBuf>, config: &Con
 			cmd.arg("--recheck")
 				.arg(format!("--root-directory={}", tmp_dir.path().display()))
 				.arg(dev.canonicalize()?)
-				.args(&config.extra_grub_install_args);
+				.args(&self.config.extra_grub_install_args);
 
-			if config.force_install {
+			if self.config.force_install {
 				cmd.arg("--force");
 			}
 			if let Some(target) = bios_target {
@@ -95,34 +145,42 @@ pub fn install(conf: &Path, temp: &Path, copied: &HashSet<PathBuf>, config: &Con
 				);
 			}
 		}
+
+		Ok(())
 	}
 
-	// install EFI GRUB
-	if let Some((efi, efi_target)) = efi_target.efi() {
+	fn install_efi(&self, efi_target: &EfiTarget) -> Result<()> {
+		let Some((efi, efi_target)) = efi_target.efi() else {
+			return Ok(());
+		};
+
 		eprintln!(
 			"installing the GRUB 2 boot loader into {}...",
-			config.efi_sys_mount_point.display()
+			self.config.efi_sys_mount_point.display()
 		);
 
 		let install = efi.join("sbin/grub-install");
 		let mut cmd = Command::new(&install);
 		cmd.arg("--recheck")
 			.arg(format!("--target={}", efi_target.display()))
-			.arg(format!("--boot-directory={}", config.boot_path.display()))
+			.arg(format!(
+				"--boot-directory={}",
+				self.config.boot_path.display()
+			))
 			.arg(format!(
 				"--efi-directory={}",
-				config.efi_sys_mount_point.display()
+				self.config.efi_sys_mount_point.display()
 			))
-			.args(&config.extra_grub_install_args);
+			.args(&self.config.extra_grub_install_args);
 
-		if config.force_install {
+		if self.config.force_install {
 			cmd.arg("--force");
 		}
-		cmd.arg(format!("--bootloader-id={}", config.bootloader_id));
+		cmd.arg(format!("--bootloader-id={}", self.config.bootloader_id));
 
-		if !config.can_touch_efi_variables {
+		if !self.config.can_touch_efi_variables {
 			cmd.arg("--no-nvram");
-			if config.efi_install_as_removable {
+			if self.config.efi_install_as_removable {
 				cmd.arg("--removable");
 			}
 		}
@@ -133,35 +191,32 @@ pub fn install(conf: &Path, temp: &Path, copied: &HashSet<PathBuf>, config: &Con
 			bail!(
 				"{}: installation of GRUB EFI into {} failed: ({status})",
 				install.display(),
-				config.efi_sys_mount_point.display()
+				self.config.efi_sys_mount_point.display()
 			);
 		}
+
+		Ok(())
 	}
-
-	// update GRUB state file
-	grub_state.save()?;
-
-	Ok(())
 }
 
-enum EfiTarget {
+enum EfiTarget<'a> {
 	Both {
-		bios: PathBuf,
-		bios_target: PathBuf,
-		efi: PathBuf,
-		efi_target: PathBuf,
+		bios: &'a Path,
+		bios_target: &'a Path,
+		efi: &'a Path,
+		efi_target: &'a Path,
 	},
 	BiosOnly {
-		bios: PathBuf,
+		bios: &'a Path,
 	},
 	EfiOnly {
-		efi: PathBuf,
-		efi_target: PathBuf,
+		efi: &'a Path,
+		efi_target: &'a Path,
 	},
 	Neither,
 }
-impl EfiTarget {
-	fn deduce(config: &Config) -> Result<Self> {
+impl<'a> EfiTarget<'a> {
+	fn deduce(config: &Config<'a>) -> Result<Self> {
 		let Config {
 			grub,
 			grub_efi,
@@ -170,12 +225,7 @@ impl EfiTarget {
 			..
 		} = config;
 
-		match (
-			grub.clone(),
-			grub_efi.clone(),
-			grub_target.clone(),
-			grub_target_efi.clone(),
-		) {
+		match (grub, grub_efi, grub_target, grub_target_efi) {
 			(Some(bios), Some(efi), Some(bios_target), Some(efi_target)) => Ok(Self::Both {
 				bios,
 				bios_target,
@@ -331,37 +381,44 @@ impl GrubState {
 	fn update(&mut self, config: &Config, efi_target: &EfiTarget) -> bool {
 		let mut dirty = false;
 
-		let device_targets = config.devices.iter().cloned().collect::<HashSet<_>>();
-		let prev_device_targets = self.devices.iter().cloned().collect::<HashSet<_>>();
+		let device_targets = config.devices.iter().copied().collect::<HashSet<_>>();
+		let prev_device_targets = self
+			.devices
+			.iter()
+			.map(|p| p.as_ref())
+			.collect::<HashSet<_>>();
 
 		if !device_targets.is_disjoint(&prev_device_targets) {
 			dirty = true;
-			self.devices.clone_from(&config.devices);
+			self.devices = config.devices.iter().map(|&p| p.to_owned()).collect();
 		}
 
 		let extra_grub_install_args = config
 			.extra_grub_install_args
 			.iter()
-			.cloned()
+			.copied()
 			.collect::<HashSet<_>>();
 		let prev_extra_grub_install_args = self
 			.extra_grub_install_args
 			.iter()
-			.cloned()
+			.map(|p| p.as_ref())
 			.collect::<HashSet<_>>();
 		if !extra_grub_install_args.is_disjoint(&prev_extra_grub_install_args) {
 			dirty = true;
-			self.extra_grub_install_args
-				.clone_from(&config.extra_grub_install_args);
+			self.extra_grub_install_args = config
+				.extra_grub_install_args
+				.iter()
+				.map(|&p| p.to_owned())
+				.collect();
 		}
 
 		if config.full_name != self.name {
 			dirty = true;
-			self.name.clone_from(&config.full_name);
+			config.full_name.clone_into(&mut self.name);
 		}
 		if config.full_version != self.version {
 			dirty = true;
-			self.version.clone_from(&config.full_version);
+			config.full_version.clone_into(&mut self.version);
 		}
 		if efi_target.to_str() != self.efi {
 			dirty = true;
@@ -369,7 +426,9 @@ impl GrubState {
 		}
 		if config.efi_sys_mount_point != self.efi_mount_point {
 			dirty = true;
-			self.efi_mount_point.clone_from(&config.efi_sys_mount_point);
+			config
+				.efi_sys_mount_point
+				.clone_into(&mut self.efi_mount_point);
 		}
 
 		dirty

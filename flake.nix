@@ -10,7 +10,7 @@
     {
       devShells = perSystem (pkgs: {
         default = pkgs.mkShell {
-          nativeBuildInputs = with pkgs; [ pkg-config rustc cargo ];
+          nativeBuildInputs = with pkgs; [ pkg-config ];
           buildInputs = with pkgs; [ libxml2 ];
         };
       });

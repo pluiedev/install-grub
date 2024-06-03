@@ -9,9 +9,7 @@ use std::{
 
 use anyhow::{bail, Context as _, Result};
 
-use crate::{config::ConfigValue, Config};
-
-static DRIVE_ID: AtomicUsize = AtomicUsize::new(1);
+use crate::config::Config;
 
 #[derive(Clone, Debug, Default)]
 pub struct Grub {
@@ -20,6 +18,8 @@ pub struct Grub {
 }
 impl Grub {
 	pub fn new(dir: &Path, config: &Config) -> Result<Self> {
+		static DRIVE_ID: AtomicUsize = AtomicUsize::new(1);
+
 		let fs = Fs::new(dir)?;
 		let mut path = dir.strip_prefix(&fs.mount)?.to_owned();
 
@@ -31,9 +31,7 @@ impl Grub {
 			// BTRFS is a special case in that we need to fix the referenced path based on
 			// subvolumes
 			if fs.fs_type == "btrfs" {
-				if let Some(p) = Self::alter_path_for_btrfs(&fs, &path)? {
-					path = p;
-				}
+				Self::alter_path_for_btrfs(&fs, &mut path)?;
 			}
 			config.fs_identifier.to_search(&fs)?
 		};
@@ -47,7 +45,7 @@ impl Grub {
 		Ok(Grub { path, search })
 	}
 
-	fn alter_path_for_btrfs(fs: &Fs, old: &Path) -> Result<Option<PathBuf>> {
+	fn alter_path_for_btrfs(fs: &Fs, path: &mut PathBuf) -> Result<()> {
 		let subvol_id = {
 			let Output {
 				status,
@@ -78,7 +76,7 @@ impl Grub {
 			});
 
 			let Some(id) = ids.next() else {
-				return Ok(None);
+				return Ok(());
 			};
 
 			if ids.next().is_some() {
@@ -91,7 +89,7 @@ impl Grub {
 			id
 		};
 
-		let path = {
+		let prefix = {
 			let Output {
 				status,
 				stdout: path_info,
@@ -137,10 +135,11 @@ impl Grub {
 			path
 		};
 
-		let mut new = Path::new("/").join(path);
-		new.push(old);
+		let mut new = Path::new("/").join(prefix);
+		new.push(&path);
+		*path = new;
 
-		Ok(Some(new))
+		Ok(())
 	}
 }
 
@@ -218,17 +217,6 @@ pub enum FsIdentifier {
 	Uuid,
 	Label,
 	Provided,
-}
-impl ConfigValue for FsIdentifier {
-	fn read(ctx: &libxml::xpath::Context, name: &str) -> Result<Self> {
-		let s = <String as ConfigValue>::read(ctx, name)?;
-		match s.as_str() {
-			"uuid" => Ok(Self::Uuid),
-			"label" => Ok(Self::Label),
-			"provided" => Ok(Self::Provided),
-			_ => bail!("Invalid FS identifier: {s}"),
-		}
-	}
 }
 impl FsIdentifier {
 	fn to_flag(self) -> &'static str {
