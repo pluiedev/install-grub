@@ -68,7 +68,7 @@ impl Grub {
 			return Ok(path);
 		}
 
-		let btrfs = std::env::var("BTRFS").context("missing environment variable $BTRFS")?;
+		let btrfs = env!("BTRFS");
 
 		let subvol_id = {
 			let Output {
@@ -291,13 +291,12 @@ impl FsIdentifier {
 
 	fn query_blkid(&self, fs: &Fs, key: &str) -> Result<String> {
 		// Based on the type pull in the identifier from the system
-		let blkid = std::env::var("BLKID").context("missing environment variable $BLKID")?;
 
 		let Output {
 			status,
 			stdout: dev_info,
 			..
-		} = Command::new(blkid)
+		} = Command::new(env!("BLKID"))
 			.arg("-o")
 			.arg("export")
 			.arg(&fs.device)

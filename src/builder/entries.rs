@@ -33,7 +33,7 @@ impl Builder<'_> {
 		}
 
 		self.add_generation(
-			&self.distro_name.clone(),
+			env!("DISTRO_NAME"),
 			"",
 			self.default_config,
 			self.config.entry_options,
@@ -50,7 +50,7 @@ impl Builder<'_> {
 	fn append_profiles(&mut self) -> Result<()> {
 		self.add_profile(
 			Path::new("/nix/var/nix/profiles/system"),
-			&format!("{} - All configurations", self.distro_name),
+			&format!("{} - All configurations", env!("DISTRO_NAME")),
 		)?;
 
 		if let Ok(system_profiles) = fs::read_dir("/nix/var/nix/profiles/system-profiles") {
