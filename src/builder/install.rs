@@ -17,7 +17,11 @@ impl Builder<'_> {
 		let efi_target = EfiTarget::deduce(&self.config)?;
 		let conf = self.config.boot_path.join("grub/grub.cfg");
 		let temp = self.config.boot_path.join("grub/grub.cfg.tmp");
-		let mut grub_state = GrubState::load(&self.config);
+
+		if self.dry_run {
+			println!("{}", self.inner);
+			return Ok(self);
+		}
 
 		fs::write(&temp, &self.inner)?;
 
@@ -29,6 +33,8 @@ impl Builder<'_> {
 			.with_context(|| format!("Cannot rename {} to {}", temp.display(), conf.display()))?;
 
 		self.remove_old_kernels()?;
+
+		let mut grub_state = GrubState::load(&self.config);
 
 		if grub_state.update(&self.config, &efi_target) {
 			if std::env::var("NIXOS_INSTALL_GRUB").as_deref() == Ok("1") {
@@ -74,9 +80,9 @@ impl Builder<'_> {
 
 		let mut cmd = Command::new(self.config.shell);
 		cmd.arg("-c").arg(format!(
-			"pkgdatadir={}/share/grub {0}/etc/grub.d/30_os-prober >> {}",
-			target_package.display(),
-			temp.display()
+			"pkgdatadir={target}/share/grub {target}/etc/grub.d/30_os-prober >> {temp}",
+			target = target_package.display(),
+			temp = temp.display()
 		));
 
 		if self.config.save_default() {

@@ -4,15 +4,13 @@
   outputs =
     { nixpkgs, ... }:
     let
+      inherit (nixpkgs) lib;
       systems = [ "x86_64-linux" ];
-      perSystem = f: nixpkgs.lib.genAttrs systems (s: f nixpkgs.legacyPackages.${s});
+      perSystem = f: lib.genAttrs systems (s: f nixpkgs.legacyPackages.${s});
     in
     {
       devShells = perSystem (pkgs: {
-        default = pkgs.mkShell {
-          nativeBuildInputs = with pkgs; [ pkg-config ];
-          buildInputs = with pkgs; [ libxml2 ];
-        };
+        default = pkgs.mkShell { nativeBuildInputs = with pkgs; [ nixfmt-rfc-style ]; };
       });
     };
 }

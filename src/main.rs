@@ -16,9 +16,12 @@ fn main() -> Result<()> {
 	let Some(config_file) = args.nth(1) else {
 		bail!("Config file not given: expected it to be the first argument")
 	};
-	// let Some(default_config) = args.next() else {
-	// 	bail!("Default config not given: expected it to be the second argument")
-	// };
+	let Some(default_config) = args.next() else {
+		bail!("Default config not given: expected it to be the second argument")
+	};
+
+	// For debugging purposes
+	let dry_run = dbg!(std::env::var("NIXOS_INSTALL_DRY_RUN")).as_deref() == Ok("true");
 
 	let document_file = std::fs::read_to_string(config_file)?;
 	let document = Document::parse(&document_file)?;
@@ -28,22 +31,20 @@ fn main() -> Result<()> {
 	// Discover whether the bootPath is on the same filesystem as / and
 	// /nix/store.  If not, then all kernels and initrds must be copied to
 	// the bootPath.
-	if std::fs::metadata(config.boot_path)?.st_dev() != std::fs::metadata("/nix/store")?.st_dev() {
+	if config.boot_path.metadata()?.st_dev() != Path::new("/nix/store").metadata()?.st_dev() {
 		config.copy_kernels = true;
 	}
 
-	dbg!(config);
+	eprintln!("updating GRUB 2 menu...");
 
-	// eprintln!("updating GRUB 2 menu...");
-	//
-	// std::env::set_var("PATH", config.path);
-	//
-	// Builder::new(config, Path::new(&default_config))?
-	// 	.users()?
-	// 	.default_entry()?
-	// 	.appearance()?
-	// 	.entries()?
-	// 	.install()?;
+	std::env::set_var("PATH", config.path);
+
+	Builder::new(config, Path::new(&default_config), dry_run)?
+		.users()?
+		.default_entry()?
+		.appearance()?
+		.entries()?
+		.install()?;
 
 	Ok(())
 }

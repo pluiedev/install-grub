@@ -18,34 +18,56 @@ pub struct Grub {
 }
 impl Grub {
 	pub fn new(dir: &Path, config: &Config) -> Result<Self> {
-		static DRIVE_ID: AtomicUsize = AtomicUsize::new(1);
-
 		let fs = Fs::new(dir)?;
-		let mut path = dir.strip_prefix(&fs.mount)?.to_owned();
 
-		let mut search = if fs.fs_type == "zfs" {
+		let path = dir.strip_prefix(&fs.mount)?.to_owned();
+
+		let (search, path) = if fs.fs_type == "zfs" {
 			// ZFS is completely separate logic as zpools are always identified by a label
 			// or custom UUID
-			todo!("ZFS confuses me")
+			let mut new_path = PathBuf::from("/");
+
+			let mut components = fs.device.components();
+			let label = if let Some(label) = components.next() {
+				new_path.push(components.as_path());
+
+				Path::new(label.as_os_str())
+			} else {
+				&fs.device
+			};
+
+			new_path.push("@");
+			new_path.push(path);
+
+			(format!("--label {}", label.display()), new_path)
 		} else {
+			let search = config.fs_identifier.to_search(&fs)?;
 			// BTRFS is a special case in that we need to fix the referenced path based on
 			// subvolumes
-			if fs.fs_type == "btrfs" {
-				Self::alter_path_for_btrfs(&fs, &mut path)?;
-			}
-			config.fs_identifier.to_search(&fs)?
+			let path = Self::alter_path_for_btrfs(&fs, path)?;
+			(search, path)
 		};
 
-		let drive_id = DRIVE_ID.fetch_add(1, SeqCst);
 		if !search.is_empty() {
-			search = format!("search --set=drive{drive_id} {search}");
-			path = Path::new(&format!("($drive{drive_id})")).join(path);
-		}
+			static DRIVE_ID: AtomicUsize = AtomicUsize::new(1);
+			let drive_id = DRIVE_ID.fetch_add(1, SeqCst);
+			let mut drive = PathBuf::from(format!("($drive{drive_id})"));
+			drive.push(path);
 
-		Ok(Grub { path, search })
+			Ok(Grub {
+				path: drive,
+				search: format!("search --set=drive{drive_id} {search}"),
+			})
+		} else {
+			Ok(Grub { path, search })
+		}
 	}
 
-	fn alter_path_for_btrfs(fs: &Fs, path: &mut PathBuf) -> Result<()> {
+	fn alter_path_for_btrfs(fs: &Fs, path: PathBuf) -> Result<PathBuf> {
+		if fs.fs_type != "btrfs" {
+			return Ok(path);
+		}
+
 		let subvol_id = {
 			let Output {
 				status,
@@ -76,7 +98,7 @@ impl Grub {
 			});
 
 			let Some(id) = ids.next() else {
-				return Ok(());
+				return Ok(path);
 			};
 
 			if ids.next().is_some() {
@@ -136,10 +158,8 @@ impl Grub {
 		};
 
 		let mut new = Path::new("/").join(prefix);
-		new.push(&path);
-		*path = new;
-
-		Ok(())
+		new.push(path);
+		Ok(new)
 	}
 }
 
@@ -229,7 +249,8 @@ impl FsIdentifier {
 
 	fn to_search(self, fs: &Fs) -> Result<String> {
 		match self {
-			Self::Uuid | Self::Label => self.query_blkid(fs),
+			Self::Uuid => self.query_blkid(fs, "UUID"),
+			Self::Label => self.query_blkid(fs, "LABEL"),
 			Self::Provided => Ok(Self::provided_search(&fs.device).unwrap_or_default()),
 		}
 	}
@@ -266,13 +287,15 @@ impl FsIdentifier {
 		))
 	}
 
-	fn query_blkid(&self, fs: &Fs) -> Result<String> {
+	fn query_blkid(&self, fs: &Fs, key: &str) -> Result<String> {
 		// Based on the type pull in the identifier from the system
 		let Output {
 			status,
 			stdout: dev_info,
 			..
-		} = Command::new("@utillinux@/bin/blkid")
+		// TODO
+		//} = Command::new("@utillinux@/bin/blkid")
+		} = Command::new("blkid")
 			.arg("-o")
 			.arg("export")
 			.arg(&fs.device)
@@ -289,17 +312,13 @@ impl FsIdentifier {
 
 		for line in dev_info.lines() {
 			let line = line?;
-			let Some((key, value)) = line.split_once('=') else {
+			let Some((k, v)) = line.split_once('=') else {
 				continue;
 			};
-			if key.eq_ignore_ascii_case(self.to_flag()) {
-				return Ok(format!("{} {value}", self.to_flag()));
+			if key == k {
+				return Ok(format!("{} {v}", self.to_flag()));
 			}
 		}
-		bail!(
-			"Couldn't find a {} for {}",
-			self.to_flag(),
-			fs.device.display()
-		);
+		bail!("Couldn't find a {key} for {}", fs.device.display());
 	}
 }

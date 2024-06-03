@@ -8,7 +8,6 @@ use std::{
 };
 
 use eyre::{bail, eyre, Context, Result};
-use indoc::eprintdoc;
 use nix::sys::stat::{umask, Mode};
 use tempfile::TempDir;
 
@@ -54,17 +53,19 @@ impl Builder<'_> {
 			"@distroName@ - All configurations",
 		)?;
 
-		for profile in fs::read_dir("/nix/var/nix/profiles/system-profiles")? {
-			let profile = profile?;
-			let file_name = profile.file_name();
-			let Some(name) = file_name.to_str() else {
-				continue;
-			};
+		if let Ok(system_profiles) = fs::read_dir("/nix/var/nix/profiles/system-profiles") {
+			for profile in system_profiles {
+				let profile = profile?;
+				let file_name = profile.file_name();
+				let Some(name) = file_name.to_str() else {
+					continue;
+				};
 
-			if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-				self.add_profile(&profile.path(), &format!("@distroName@ - Profile '{name}'"))?;
+				if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+					self.add_profile(&profile.path(), &format!("@distroName@ - Profile '{name}'"))?;
+				}
 			}
-		}
+		};
 
 		Ok(())
 	}
@@ -77,10 +78,13 @@ impl Builder<'_> {
 		)?;
 
 		let Some(parent) = profile.parent() else {
-			todo!("Profile directory is somehow root?")
+			bail!("Profile directory should not be root!")
 		};
 		let Some(name) = profile.file_name() else {
-			todo!("Huh???")
+			bail!(
+				"Profile `{}` somehow does not have a file name!",
+				profile.display()
+			)
 		};
 
 		let mut links = fs::read_dir(parent)?
@@ -142,7 +146,7 @@ impl Builder<'_> {
 		if !current && !links.is_empty() {
 			writeln!(
 				&mut self.inner,
-				r#"submenu \"> {name}{name_suffix}\" --class submenu {{"#
+				r#"submenu "> {name}{name_suffix}" --class submenu {{"#
 			)?;
 		}
 
@@ -164,14 +168,16 @@ impl Builder<'_> {
 					.join("kernel")
 					.canonicalize()?
 					.parent()
-					.ok_or_else(|| eyre!("Somehow $link/kernel doesn't have a parent"))?
+					.ok_or_else(|| {
+						eyre!("Somehow {}/kernel doesn't have a parent..?", link.display())
+					})?
 					.join("lib/modules");
 
 				let Some(version) = fs::read_dir(&modules)?.find_map(|m| {
 					m.ok()
 						.and_then(|p| Some(p.path().file_name()?.to_string_lossy().into_owned()))
 				}) else {
-					bail!("Somehow could not deduce the current NixOS version")
+					bail!("Could not deduce the current NixOS version")
 				};
 
 				version
@@ -196,8 +202,7 @@ impl Builder<'_> {
 	}
 
 	fn generation_date_from_link(link: &Path) -> Result<time::Date> {
-		let metadata = fs::metadata(link)?;
-		let sys_time = metadata.modified()?;
+		let sys_time = link.metadata()?.modified()?;
 
 		Ok(time::OffsetDateTime::from(sys_time).date())
 	}
@@ -229,7 +234,7 @@ impl Builder<'_> {
 		let xen = path.join("xen.gz");
 		let xen = if xen.exists() {
 			Some((
-				self.copy_to_kernels_dir(&xen.canonicalize()?)?,
+				self.copy_to_kernels_dir(&xen)?,
 				fs::read_to_string(path.join("xen-params")).unwrap_or_default(),
 			))
 		} else {
@@ -305,52 +310,65 @@ impl Builder<'_> {
 		let secrets_name = format!("{system_name}-secrets");
 		let initrd_secrets_path = kernels.join(&secrets_name);
 
-		fs::create_dir(&kernels)?;
-		fs::set_permissions(&kernels, PermissionsExt::from_mode(0o755))?;
+		let secrets_added = if !self.dry_run {
+			fs::create_dir_all(&kernels)?;
+			fs::set_permissions(&kernels, PermissionsExt::from_mode(0o755))?;
 
-		// Make sure initrd is not world readable (won't work if /boot is FAT)
-		let old_umask = umask(Mode::from_bits_truncate(0o137));
+			// Make sure initrd is not world readable (won't work if /boot is FAT)
+			let old_umask = umask(Mode::from_bits_truncate(0o137));
 
-		let initrd_secrets_path_temp = TempDir::with_prefix(&secrets_name)?;
+			let initrd_secrets_path_temp = TempDir::with_prefix(&secrets_name)?;
 
-		let status = Command::new(&append_initrd_secrets)
-			.arg(initrd_secrets_path_temp.path())
-			.status()?;
+			let status = Command::new(&append_initrd_secrets)
+				.arg(initrd_secrets_path_temp.path())
+				.status()?;
 
-		if !status.success() {
-			if current {
-				bail!("Failed to create initrd secrets ({status})");
-			} else {
-				eprintdoc!(
-					"warning: failed to create initrd secrets for \"{name}\", an older generation
-
-					note: this is normal after having removed or renamed a file in `boot.initrd.secrets`"
-				);
+			if !status.success() {
+				if current {
+					bail!("Failed to create initrd secrets ({status})");
+				} else {
+					eprintln!(
+						"warning: failed to create initrd secrets for \"{name}\", an older \
+						 generation"
+					);
+					eprintln!(
+						" note: this is normal after having removed or renamed a file in \
+						 `boot.initrd.secrets`"
+					);
+				}
 			}
-		}
 
-		// Check whether any secrets were actually added
-		let secrets_dir = if fs::metadata(&initrd_secrets_path_temp).map_or(0, |m| m.len()) > 0 {
-			fs::rename(&initrd_secrets_path_temp, &initrd_secrets_path)
-				.context("Failed to move initrd secrets into place")?;
+			// Restore umask
+			// Temp dir is automatically cleaned up.
+			umask(old_umask);
 
-			self.copied.insert(initrd_secrets_path);
+			// Check whether any secrets were actually added
+			if fs::metadata(&initrd_secrets_path_temp).map_or(0, |m| m.len()) > 0 {
+				fs::rename(&initrd_secrets_path_temp, &initrd_secrets_path)
+					.context("Failed to move initrd secrets into place")?;
 
-			let mut secrets_dir = self.grub_boot_path_normalized.join("kernels");
+				self.copied.insert(initrd_secrets_path);
+
+				true
+			} else {
+				false
+			}
+		} else {
+			true
+		};
+
+		Ok(if secrets_added {
+			let mut secrets_dir = self.grub_boot.path.join("kernels");
 			secrets_dir.push(&secrets_name);
 			Some(secrets_dir)
 		} else {
 			None
-		};
-
-		// Restore umask
-		// Temp dir is automatically cleaned up.
-		umask(old_umask);
-
-		Ok(secrets_dir)
+		})
 	}
 
 	fn copy_to_kernels_dir(&mut self, path: &Path) -> Result<PathBuf> {
+		let path = path.canonicalize()?;
+
 		let Ok(path) = path.strip_prefix("/nix/store") else {
 			bail!("Path {} is not in /nix/store!", path.display())
 		};
@@ -368,7 +386,7 @@ impl Builder<'_> {
 		// Don't copy the file if $dst already exists.  This means that we
 		// have to create $dst atomically to prevent partially copied
 		// kernels or initrd if this script is ever interrupted.
-		if !dst.exists() {
+		if !self.dry_run && !dst.exists() {
 			let Some(mut name) = dst.file_name().map(|s| s.to_os_string()) else {
 				bail!(
 					"Somehow path {} does not have a file name...? This shouldn't be possible!",
@@ -386,6 +404,6 @@ impl Builder<'_> {
 		}
 
 		self.copied.insert(dst);
-		Ok(self.grub_boot_path_normalized.join("kernels/name"))
+		Ok(self.grub_boot.path.join("kernels/name"))
 	}
 }

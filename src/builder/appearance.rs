@@ -27,14 +27,17 @@ impl Builder<'_> {
 			..
 		} = &self.config;
 
-		fs::copy(font, boot_path.join("converted-font.pf2")).with_context(|| {
-			format!("Cannot copy {} to {}", font.display(), boot_path.display())
-		})?;
+		let font_path = boot_path.join("converted-font.pf2");
+		if !self.dry_run {
+			fs::copy(font, font_path).with_context(|| {
+				format!("Cannot copy {} to {}", font.display(), boot_path.display())
+			})?;
+		}
 
-		write!(
+		writeln!(
 			&mut self.inner,
 			r#"insmod font
-if loadfont "{}"/converted-font.pf2; then
+if loadfont {font}; then
   insmod gfxterm
   if [ "${{grub_platform}}" = "efi" ]; then
     set gfxmode={gfx_mode_efi}
@@ -46,7 +49,7 @@ if loadfont "{}"/converted-font.pf2; then
   terminal_output gfxterm
 fi
 "#,
-			self.grub_boot_path_normalized.display(),
+			font = self.grub_boot.path.join("convert-font.pf2").display(),
 		)?;
 
 		Ok(())
@@ -80,22 +83,24 @@ fi
 		target.set_extension(ext.as_ref());
 
 		if let Some(background_color) = background_color {
-			write!(&mut self.inner, "background_color '{background_color}'")?;
+			writeln!(&mut self.inner, "background_color '{background_color}'")?;
 		}
 
-		fs::copy(splash_image, boot_path.join(&target)).with_context(|| {
-			format!(
-				"Cannot copy {} to {}",
-				splash_image.display(),
-				boot_path.display()
-			)
-		})?;
+		if !self.dry_run {
+			fs::copy(splash_image, boot_path.join(&target)).with_context(|| {
+				format!(
+					"Cannot copy {} to {}",
+					splash_image.display(),
+					boot_path.display()
+				)
+			})?;
+		}
 
 		let splash_mode = splash_mode.unwrap_or_default();
-		write!(
+		writeln!(
 			&mut self.inner,
 			r#"insmod {ext}
-if background_image --mode '{splash_mode}' "{boot_path}"/{target}; then
+if background_image --mode '{splash_mode}' {target}; then
   set color_normal=white/black
   set color_highlight=black/white
 else
@@ -103,8 +108,7 @@ else
   set menu_color_highlight=white/blue
 fi
 "#,
-			boot_path = self.grub_boot_path_normalized.display(),
-			target = target.display(),
+			target = self.grub_boot.path.join(target).display(),
 		)?;
 
 		Ok(())
@@ -116,7 +120,7 @@ fi
 		} = &self.config;
 		let theme_dir = boot_path.join("theme");
 
-		if theme_dir.exists() {
+		if !self.dry_run && theme_dir.exists() {
 			fs::remove_dir_all(&theme_dir).with_context(|| {
 				format!("Cannot clean up theme folder in {}", boot_path.display())
 			})?;
@@ -143,30 +147,31 @@ fi
 				}
 			}
 
-			fs::copy(entry.path(), theme_dir.join(relative))?;
+			if !self.dry_run {
+				fs::copy(entry.path(), theme_dir.join(relative))?;
+			}
 		}
 
 		for module in modules_to_load {
-			write!(&mut self.inner, "insmod {module}")?;
+			writeln!(&mut self.inner, "insmod {module}")?;
 		}
 
-		write!(
+		let mut boot_font_path = self.grub_boot.path.join("theme");
+
+		writeln!(
 			&mut self.inner,
 			r#"# Sets theme.
-set theme="{boot_path}"/theme/theme.txt
+set theme={}
 export theme
 # Load theme fonts, if any
 "#,
-			boot_path = self.grub_boot_path_normalized.display(),
+			boot_font_path.join("theme.txt").display(),
 		)?;
 
 		for font in fonts {
-			write!(
-				&mut self.inner,
-				r#"loadfont "{}"/theme/{}"#,
-				self.grub_boot_path_normalized.display(),
-				font.display(),
-			)?;
+			boot_font_path.push(font);
+			write!(&mut self.inner, "loadfont {}", boot_font_path.display())?;
+			boot_font_path.pop();
 		}
 
 		Ok(())
