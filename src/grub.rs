@@ -68,12 +68,14 @@ impl Grub {
 			return Ok(path);
 		}
 
+		let btrfs = std::env::var("BTRFS").context("missing environment variable $BTRFS")?;
+
 		let subvol_id = {
 			let Output {
 				status,
 				stdout: id_info,
 				..
-			} = Command::new("@btrfsprogs@/bin/btrfs")
+			} = Command::new(&btrfs)
 				.arg("subvol")
 				.arg("show")
 				.arg(&fs.mount)
@@ -116,7 +118,7 @@ impl Grub {
 				status,
 				stdout: path_info,
 				..
-			} = Command::new("@btrfsprogs@/bin/btrfs")
+			} = Command::new(&btrfs)
 				.arg("subvol")
 				.arg("list")
 				.arg(&fs.mount)
@@ -289,13 +291,13 @@ impl FsIdentifier {
 
 	fn query_blkid(&self, fs: &Fs, key: &str) -> Result<String> {
 		// Based on the type pull in the identifier from the system
+		let blkid = std::env::var("BLKID").context("missing environment variable $BLKID")?;
+
 		let Output {
 			status,
 			stdout: dev_info,
 			..
-		// TODO
-		//} = Command::new("@utillinux@/bin/blkid")
-		} = Command::new("blkid")
+		} = Command::new(blkid)
 			.arg("-o")
 			.arg("export")
 			.arg(&fs.device)

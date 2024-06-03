@@ -21,7 +21,6 @@ fn main() -> Result<()> {
 	};
 
 	// For debugging purposes
-	let dry_run = dbg!(std::env::var("NIXOS_INSTALL_DRY_RUN")).as_deref() == Ok("true");
 
 	let document_file = std::fs::read_to_string(config_file)?;
 	let document = Document::parse(&document_file)?;
@@ -39,7 +38,7 @@ fn main() -> Result<()> {
 
 	std::env::set_var("PATH", config.path);
 
-	Builder::new(config, Path::new(&default_config), dry_run)?
+	Builder::new(config, Path::new(&default_config))?
 		.users()?
 		.default_entry()?
 		.appearance()?

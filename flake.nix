@@ -10,7 +10,17 @@
     in
     {
       devShells = perSystem (pkgs: {
-        default = pkgs.mkShell { nativeBuildInputs = with pkgs; [ nixfmt-rfc-style ]; };
+        default = pkgs.mkShell {
+          nativeBuildInputs = with pkgs; [ nixfmt-rfc-style ];
+          buildInputs = with pkgs; [
+            btrfs-progs
+            util-linux
+          ];
+
+          BLKID = pkgs.lib.getExe' pkgs.util-linux "blkid";
+          BTRFS = pkgs.lib.getExe' pkgs.btrfs-progs "btrfs";
+          DISTRO_NAME = "NixOS";
+        };
       });
     };
 }
